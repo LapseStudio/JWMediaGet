@@ -59,35 +59,127 @@ def collect_videos(db_path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     seen, result = set(), []
-    def add(label, sym, fp, track, lang, issue, source):
-        key = (sym, track, lang, issue)
+    def add(label, sym, fp, track, lang, issue, source, docid=None, booknum=None):
+        key = (sym, track, lang, issue, docid)
         if key in seen or not fp: return
         seen.add(key)
         result.append(dict(label=(label or "").replace('\xa0',' ').strip(),
-            symbol=sym, filepath=fp, track=track, lang_idx=lang, issue=issue or "", source=source))
-    cur.execute("SELECT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,IssueTagNumber FROM Multimedia WHERE MajorType=2 AND FilePath!='' ORDER BY Track")
-    for row in cur.fetchall(): add(*row, "урок")
-    cur.execute("SELECT DISTINCT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,IssueTagNumber FROM ExtractMultimedia WHERE MajorType=2 AND FilePath!='' ORDER BY KeySymbol,IssueTagNumber,Track")
-    for row in cur.fetchall(): add(*row, "материал")
+            symbol=sym, filepath=fp, track=track, lang_idx=lang,
+            issue=issue or "", source=source, docid=docid, booknum=booknum))
+    # Для Библии (nwt) нужен booknum — получаем через BibleBook
+    try:
+        cur.execute("""
+            SELECT m.Label, m.KeySymbol, m.FilePath, m.Track, m.MepsLanguageIndex,
+                   m.IssueTagNumber, m.MepsDocumentId, bb.BibleBookId
+            FROM Multimedia m
+            LEFT JOIN Document d ON d.MepsDocumentId = m.MepsDocumentId
+                AND d.MepsLanguageIndex = m.MepsLanguageIndex
+            LEFT JOIN BibleBook bb ON bb.BookDocumentId = d.DocumentId
+            WHERE m.MajorType=2 AND m.FilePath!=''
+            ORDER BY m.MepsDocumentId, m.Track
+        """)
+        for label,sym,fp,track,lang,issue,docid,booknum in cur.fetchall():
+            add(label, sym, fp, track, lang, issue, "урок", docid, booknum)
+    except Exception:
+        cur.execute("SELECT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,IssueTagNumber,MepsDocumentId FROM Multimedia WHERE MajorType=2 AND FilePath!='' ORDER BY MepsDocumentId,Track")
+        for label,sym,fp,track,lang,issue,docid in cur.fetchall():
+            add(label, sym, fp, track, lang, issue, "урок", docid)
+    try:
+        cur.execute("""
+            SELECT DISTINCT m.Label, m.KeySymbol, m.FilePath, m.Track, m.MepsLanguageIndex,
+                   m.IssueTagNumber, m.MepsDocumentId, bb.BibleBookId
+            FROM ExtractMultimedia m
+            LEFT JOIN Document d ON d.MepsDocumentId = m.MepsDocumentId
+                AND d.MepsLanguageIndex = m.MepsLanguageIndex
+            LEFT JOIN BibleBook bb ON bb.BookDocumentId = d.DocumentId
+            WHERE m.MajorType=2 AND m.FilePath!=''
+            ORDER BY m.KeySymbol, m.IssueTagNumber, m.Track
+        """)
+        for label,sym,fp,track,lang,issue,docid,booknum in cur.fetchall():
+            add(label, sym, fp, track, lang, issue, "материал", docid, booknum)
+    except Exception:
+        cur.execute("SELECT DISTINCT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,IssueTagNumber,MepsDocumentId FROM ExtractMultimedia WHERE MajorType=2 AND FilePath!='' ORDER BY KeySymbol,IssueTagNumber,Track")
+        for label,sym,fp,track,lang,issue,docid in cur.fetchall():
+            add(label, sym, fp, track, lang, issue, "материал", docid)
     conn.close()
     return result
 
-def api_get_url(session, pub, track, langwritten, quality, issue=""):
-    params = dict(langwritten=langwritten, pub=pub, fileformat="MP4", track=track)
-    if issue: params["issue"] = issue
-    try:
-        r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS", params=params, timeout=30)
-        r.raise_for_status()
-        variants = r.json()["files"][langwritten]["MP4"]
-    except Exception as e:
-        return None, str(e)
-    target = f"{quality}p"
-    chosen = next((v for v in variants if v.get("label") == target), None)
-    if not chosen:
-        chosen = sorted(variants, key=lambda x: {"240p":1,"360p":2,"480p":3,"720p":4}.get(x.get("label",""),0), reverse=True)[0] if variants else None
-    if not chosen: return None, "нет вариантов"
-    url = chosen["file"]["url"]
-    return url, url.split("/")[-1]
+def api_get_url(session, pub, track, langwritten, quality, issue="", filepath="", docid=None, booknum=None):
+    # Для Библии (nwt): используем pub+booknum+track, НЕ docid
+    if pub and booknum:
+        for fmt in ["MP4", "M4V"]:
+            try:
+                r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS",
+                    params=dict(langwritten=langwritten, pub=pub, booknum=booknum,
+                                track=track, fileformat=fmt),
+                    timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                variants = data.get("files", {}).get(langwritten, {}).get(fmt)
+                if not variants: continue
+                target = f"{quality}p"
+                chosen = next((v for v in variants if v.get("label") == target), None)
+                if not chosen:
+                    chosen = sorted(variants, key=lambda x: {"240p":1,"360p":2,"480p":3,"720p":4}.get(x.get("label",""),0), reverse=True)[0] if variants else None
+                if not chosen: continue
+                url = chosen["file"]["url"]
+                fname = url.split("/")[-1]
+                api_pub = chosen.get("pub", pub)
+                api_booknum = chosen.get("booknum", booknum)
+                return url, fname, api_pub, api_booknum
+            except Exception:
+                continue
+        return None, "booknum не найден", "", 0
+
+    # Если есть docid — используем его
+    if docid:
+        for fmt in ["MP4", "M4V"]:
+            try:
+                r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS",
+                    params=dict(langwritten=langwritten, docid=docid, fileformat=fmt, track=track),
+                    timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                variants = data.get("files", {}).get(langwritten, {}).get(fmt)
+                if not variants: continue
+                target = f"{quality}p"
+                chosen = next((v for v in variants if v.get("label") == target), None)
+                if not chosen:
+                    chosen = sorted(variants, key=lambda x: {"240p":1,"360p":2,"480p":3,"720p":4}.get(x.get("label",""),0), reverse=True)[0] if variants else None
+                if not chosen: continue
+                url = chosen["file"]["url"]
+                fname = url.split("/")[-1]
+                api_pub   = chosen.get("pub", "")
+                api_booknum = chosen.get("booknum", 0)
+                return url, fname, api_pub, api_booknum
+            except Exception:
+                continue
+        if not pub:
+            return None, "docid не найден", "", 0
+
+    # Обычные публикации — pub + track
+    params_base = dict(langwritten=langwritten, pub=pub, track=track)
+    if issue: params_base["issue"] = issue
+    for fmt in ["MP4", "M4V"]:
+        params = {**params_base, "fileformat": fmt}
+        try:
+            r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS", params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            variants = data.get("files", {}).get(langwritten, {}).get(fmt)
+            if not variants: continue
+        except Exception:
+            continue
+        target = f"{quality}p"
+        chosen = next((v for v in variants if v.get("label") == target), None)
+        if not chosen:
+            chosen = sorted(variants, key=lambda x: {"240p":1,"360p":2,"480p":3,"720p":4}.get(x.get("label",""),0), reverse=True)[0] if variants else None
+        if not chosen: continue
+        url = chosen["file"]["url"]
+        api_pub     = chosen.get("pub", pub)
+        api_booknum = chosen.get("booknum", 0)
+        return url, url.split("/")[-1], api_pub, api_booknum
+    return None, "формат не найден", "", 0
 
 def download_file(url, dest, session, progress_cb=None):
     r = session.get(url, stream=True, timeout=180)
@@ -347,7 +439,7 @@ class App(ctk.CTk):
                 self._log("Остановлено")
                 break
 
-            key = f"{v['symbol']}_{v['track']}_{v['lang_idx']}_{v['issue']}"
+            key = f"{v['symbol']}_{v.get('booknum') or ''}_{v['track']}_{v['lang_idx']}_{v['issue']}"
             lw  = lang_code(v["lang_idx"])
 
             self.after(0, lambda p=i/total: self.bar.set(p))
@@ -359,18 +451,25 @@ class App(ctk.CTk):
             if saved.get(key) == "ok":
                 skip += 1; continue
 
-            url, fname = api_get_url(session, v["symbol"], v["track"], lw, quality, v["issue"])
+            url, fname, api_pub, api_booknum = api_get_url(session, v["symbol"], v["track"], lw, quality, v["issue"], v["filepath"], v.get("docid"), v.get("booknum"))
             if url is None:
                 err += 1
                 self._log(f"✗ {v['label'][:52]}")
                 saved[key] = "err"; time.sleep(0.3); continue
 
-            # Папка по публикации как в JW Library:
-            # есть KeySymbol → outdir/pt14sl_RSL/ , outdir/w_RSL/ и т.д.
-            # нет KeySymbol (docid-видео) → прямо в outdir/
-            if v["symbol"]:
+            # Логика папки как в JW Library:
+            # Некоторые pub — глобальные медиа, они идут в корень
+            # Остальные — в папку pub_RSL/
+            ROOT_PUBS = {
+                'sjj', 'sjjm', 'pk', 'ndl', 'wpc', 'wcgv',
+                'jlp', 'jwbcov', 'jwbcov21', 'jwbcov22',
+                'jwbcov23', 'jwbcov24', 'jwbcov25',
+            }
+            sym = api_pub or v["symbol"] or ""
+            is_root = (not sym) or (sym.lower() in ROOT_PUBS) or sym.lower().startswith('jwbcov')
+            if sym and not is_root:
                 lang_suffix = f"_{lw}" if lw != "E" else ""
-                pub_folder = os.path.join(outdir, f"{v['symbol']}{lang_suffix}")
+                pub_folder = os.path.join(outdir, f"{sym}{lang_suffix}")
             else:
                 pub_folder = outdir
             os.makedirs(pub_folder, exist_ok=True)
