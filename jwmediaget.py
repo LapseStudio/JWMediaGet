@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, json, sqlite3, zipfile, tempfile, shutil, time, threading
+import os, sys, json, sqlite3, zipfile, tempfile, shutil, time, threading, re
 from pathlib import Path
 from tkinter import filedialog, messagebox
 import tkinter as tk
@@ -36,6 +36,12 @@ JW_RED          = "#c62828"
 
 LANG_IDX_TO_CODE = {0: "E", 474: "RSL"}
 
+ROOT_PUBS = {
+    'sjj', 'sjjm', 'pk', 'ndl', 'wpc', 'wcgv',
+    'jlp', 'jwbcov', 'jwbcov21', 'jwbcov22',
+    'jwbcov23', 'jwbcov24', 'jwbcov25',
+}
+
 def lang_code(idx):
     return LANG_IDX_TO_CODE.get(int(idx), "E") if idx is not None else "E"
 
@@ -55,18 +61,34 @@ def extract_db(jwpub_path, tmpdir):
         z.extract(dbs[0], tmpdir)
     return os.path.join(tmpdir, dbs[0])
 
+def pub_from_caption(caption):
+    if not caption: return None
+    m = re.search(r'class="eloc">([a-zA-Z0-9_-]+)', caption)
+    return m.group(1) if m else None
+
+def pub_from_filename(fname):
+    if not fname: return None
+    base = fname.split(".")[0]
+    parts = base.split("_")
+    return parts[2] if len(parts) >= 3 else None
+
 def collect_videos(db_path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     seen, result = set(), []
-    def add(label, sym, fp, track, lang, issue, source, docid=None, booknum=None):
+
+    def add(label, sym, fp, track, lang, issue, source, docid=None, booknum=None, caption=None):
         key = (sym, track, lang, issue, docid)
         if key in seen or not fp: return
         seen.add(key)
-        result.append(dict(label=(label or "").replace('\xa0',' ').strip(),
+        result.append(dict(
+            label=(label or "").replace('\xa0', ' ').strip(),
             symbol=sym, filepath=fp, track=track, lang_idx=lang,
-            issue=issue or "", source=source, docid=docid, booknum=booknum))
-    # Для Библии (nwt) нужен booknum — получаем через BibleBook
+            issue=issue or "", source=source, docid=docid,
+            booknum=booknum, caption=caption,
+        ))
+
+    # Уроки (Multimedia)
     try:
         cur.execute("""
             SELECT m.Label, m.KeySymbol, m.FilePath, m.Track, m.MepsLanguageIndex,
@@ -78,107 +100,165 @@ def collect_videos(db_path):
             WHERE m.MajorType=2 AND m.FilePath!=''
             ORDER BY m.MepsDocumentId, m.Track
         """)
-        for label,sym,fp,track,lang,issue,docid,booknum in cur.fetchall():
+        for label, sym, fp, track, lang, issue, docid, booknum in cur.fetchall():
             add(label, sym, fp, track, lang, issue, "урок", docid, booknum)
     except Exception:
-        cur.execute("SELECT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,IssueTagNumber,MepsDocumentId FROM Multimedia WHERE MajorType=2 AND FilePath!='' ORDER BY MepsDocumentId,Track")
-        for label,sym,fp,track,lang,issue,docid in cur.fetchall():
+        cur.execute("""SELECT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,
+                   IssueTagNumber,MepsDocumentId FROM Multimedia
+                   WHERE MajorType=2 AND FilePath!='' ORDER BY MepsDocumentId,Track""")
+        for label, sym, fp, track, lang, issue, docid in cur.fetchall():
             add(label, sym, fp, track, lang, issue, "урок", docid)
+
+    # Доп. материалы (ExtractMultimedia) с Caption
     try:
         cur.execute("""
-            SELECT DISTINCT m.Label, m.KeySymbol, m.FilePath, m.Track, m.MepsLanguageIndex,
-                   m.IssueTagNumber, m.MepsDocumentId, bb.BibleBookId
-            FROM ExtractMultimedia m
-            LEFT JOIN Document d ON d.MepsDocumentId = m.MepsDocumentId
-                AND d.MepsLanguageIndex = m.MepsLanguageIndex
+            SELECT DISTINCT em.Label, em.KeySymbol, em.FilePath, em.Track,
+                   em.MepsLanguageIndex, em.IssueTagNumber, em.MepsDocumentId,
+                   bb.BibleBookId, e.Caption
+            FROM ExtractMultimedia em
+            LEFT JOIN Extract e ON e.ExtractId = em.ExtractId
+            LEFT JOIN Document d ON d.MepsDocumentId = em.MepsDocumentId
+                AND d.MepsLanguageIndex = em.MepsLanguageIndex
             LEFT JOIN BibleBook bb ON bb.BookDocumentId = d.DocumentId
-            WHERE m.MajorType=2 AND m.FilePath!=''
-            ORDER BY m.KeySymbol, m.IssueTagNumber, m.Track
+            WHERE em.MajorType=2 AND em.FilePath!=''
+            ORDER BY em.KeySymbol, em.IssueTagNumber, em.Track
         """)
-        for label,sym,fp,track,lang,issue,docid,booknum in cur.fetchall():
-            add(label, sym, fp, track, lang, issue, "материал", docid, booknum)
+        for label, sym, fp, track, lang, issue, docid, booknum, caption in cur.fetchall():
+            add(label, sym, fp, track, lang, issue, "материал", docid, booknum, caption)
     except Exception:
-        cur.execute("SELECT DISTINCT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,IssueTagNumber,MepsDocumentId FROM ExtractMultimedia WHERE MajorType=2 AND FilePath!='' ORDER BY KeySymbol,IssueTagNumber,Track")
-        for label,sym,fp,track,lang,issue,docid in cur.fetchall():
+        cur.execute("""SELECT DISTINCT Label,KeySymbol,FilePath,Track,MepsLanguageIndex,
+                   IssueTagNumber,MepsDocumentId FROM ExtractMultimedia
+                   WHERE MajorType=2 AND FilePath!='' ORDER BY KeySymbol,IssueTagNumber,Track""")
+        for label, sym, fp, track, lang, issue, docid in cur.fetchall():
             add(label, sym, fp, track, lang, issue, "материал", docid)
+
     conn.close()
     return result
 
+def collect_bible_chapters(db_path, lang_idx):
+    """Парсит BibleCitation и возвращает уникальные главы для скачивания."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    result = []
+    seen = set()
+    try:
+        cur.execute("""
+            SELECT DISTINCT h.Link
+            FROM BibleCitation bc
+            LEFT JOIN Hyperlink h ON h.HyperlinkId = bc.HyperlinkId
+            WHERE h.Link IS NOT NULL
+        """)
+        for (link,) in cur.fetchall():
+            # jwpub://b/NWTR/43:8:28-43:8:28  →  book=43, chapter=8
+            m = re.search(r'/(\d+):(\d+):\d+', link)
+            if not m: continue
+            booknum = int(m.group(1))
+            chapter = int(m.group(2))
+            key = (booknum, chapter)
+            if key in seen: continue
+            seen.add(key)
+            result.append(dict(
+                label=f"nwt кн.{booknum} гл.{chapter}",
+                symbol="nwt",
+                filepath="",
+                track=chapter,       # track = номер главы
+                lang_idx=lang_idx,
+                issue="",
+                source="библия",
+                docid=None,
+                booknum=booknum,
+                caption=None,
+            ))
+    except Exception as e:
+        pass
+    conn.close()
+    return sorted(result, key=lambda x: (x["booknum"], x["track"]))
+
+def resolve_pub_symbol(v, api_pub, fname):
+    """Приоритет: api_pub → KeySymbol → Caption → имя файла."""
+    sym = (api_pub or "").strip()
+    if sym: return sym
+    sym = (v.get("symbol") or "").strip()
+    if sym: return sym
+    sym = pub_from_caption(v.get("caption")) or ""
+    if sym: return sym
+    return pub_from_filename(fname) or ""
+
+def pub_folder_name(sym, lw, issue):
+    """Строит имя папки по логике JW Library."""
+    lang_suffix = f"_{lw}" if lw != "E" else ""
+    issue_val = str(issue) if issue and str(issue) != "0" else ""
+    issue_suffix = f"_{issue_val}" if issue_val else ""
+    return f"{sym}{lang_suffix}{issue_suffix}"
+
+def _pick_quality(variants, quality):
+    target = f"{quality}p"
+    chosen = next((v for v in variants if v.get("label") == target), None)
+    if not chosen:
+        order = {"240p": 1, "360p": 2, "480p": 3, "720p": 4}
+        chosen = sorted(variants, key=lambda x: order.get(x.get("label", ""), 0), reverse=True)
+        chosen = chosen[0] if chosen else None
+    return chosen
+
 def api_get_url(session, pub, track, langwritten, quality, issue="", filepath="", docid=None, booknum=None):
-    # Для Библии (nwt): используем pub+booknum+track, НЕ docid
+    # Библия: pub=nwtsty + booknum + track(глава)
     if pub and booknum:
         for fmt in ["MP4", "M4V"]:
             try:
                 r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS",
                     params=dict(langwritten=langwritten, pub=pub, booknum=booknum,
-                                track=track, fileformat=fmt),
-                    timeout=30)
+                                track=track, fileformat=fmt), timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 variants = data.get("files", {}).get(langwritten, {}).get(fmt)
                 if not variants: continue
-                target = f"{quality}p"
-                chosen = next((v for v in variants if v.get("label") == target), None)
-                if not chosen:
-                    chosen = sorted(variants, key=lambda x: {"240p":1,"360p":2,"480p":3,"720p":4}.get(x.get("label",""),0), reverse=True)[0] if variants else None
+                chosen = _pick_quality(variants, quality)
                 if not chosen: continue
                 url = chosen["file"]["url"]
                 fname = url.split("/")[-1]
-                api_pub = chosen.get("pub", pub)
-                api_booknum = chosen.get("booknum", booknum)
-                return url, fname, api_pub, api_booknum
+                return url, fname, chosen.get("pub", pub), chosen.get("booknum", booknum)
             except Exception:
                 continue
         return None, "booknum не найден", "", 0
 
-    # Если есть docid — используем его
+    # docid
     if docid:
         for fmt in ["MP4", "M4V"]:
             try:
                 r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS",
-                    params=dict(langwritten=langwritten, docid=docid, fileformat=fmt, track=track),
-                    timeout=30)
+                    params=dict(langwritten=langwritten, docid=docid,
+                                fileformat=fmt, track=track), timeout=30)
                 r.raise_for_status()
                 data = r.json()
                 variants = data.get("files", {}).get(langwritten, {}).get(fmt)
                 if not variants: continue
-                target = f"{quality}p"
-                chosen = next((v for v in variants if v.get("label") == target), None)
-                if not chosen:
-                    chosen = sorted(variants, key=lambda x: {"240p":1,"360p":2,"480p":3,"720p":4}.get(x.get("label",""),0), reverse=True)[0] if variants else None
+                chosen = _pick_quality(variants, quality)
                 if not chosen: continue
                 url = chosen["file"]["url"]
                 fname = url.split("/")[-1]
-                api_pub   = chosen.get("pub", "")
-                api_booknum = chosen.get("booknum", 0)
-                return url, fname, api_pub, api_booknum
+                return url, fname, chosen.get("pub", ""), chosen.get("booknum", 0)
             except Exception:
                 continue
         if not pub:
             return None, "docid не найден", "", 0
 
-    # Обычные публикации — pub + track
+    # Обычные публикации
     params_base = dict(langwritten=langwritten, pub=pub, track=track)
     if issue: params_base["issue"] = issue
     for fmt in ["MP4", "M4V"]:
-        params = {**params_base, "fileformat": fmt}
         try:
-            r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS", params=params, timeout=30)
+            r = session.get("https://app.jw-cdn.org/apis/pub-media/GETPUBMEDIALINKS",
+                params={**params_base, "fileformat": fmt}, timeout=30)
             r.raise_for_status()
             data = r.json()
             variants = data.get("files", {}).get(langwritten, {}).get(fmt)
             if not variants: continue
+            chosen = _pick_quality(variants, quality)
+            if not chosen: continue
+            url = chosen["file"]["url"]
+            return url, url.split("/")[-1], chosen.get("pub", pub), chosen.get("booknum", 0)
         except Exception:
             continue
-        target = f"{quality}p"
-        chosen = next((v for v in variants if v.get("label") == target), None)
-        if not chosen:
-            chosen = sorted(variants, key=lambda x: {"240p":1,"360p":2,"480p":3,"720p":4}.get(x.get("label",""),0), reverse=True)[0] if variants else None
-        if not chosen: continue
-        url = chosen["file"]["url"]
-        api_pub     = chosen.get("pub", pub)
-        api_booknum = chosen.get("booknum", 0)
-        return url, url.split("/")[-1], api_pub, api_booknum
     return None, "формат не найден", "", 0
 
 def download_file(url, dest, session, progress_cb=None):
@@ -201,22 +281,19 @@ def download_file(url, dest, session, progress_cb=None):
 # ── Красивый переключатель ─────────────────────────────────────────────────
 
 class Selector(ctk.CTkFrame):
-    """Горизонтальный переключатель с белым текстом на выбранной кнопке."""
-    def __init__(self, parent, choices, callback=None, **kw):
+    def __init__(self, parent, choices, callback=None, default=None, **kw):
         super().__init__(parent, fg_color=JW_PURPLE_LIGHT, corner_radius=8, **kw)
         self._choices  = choices
         self._callback = callback
-        self._value    = choices[0][1]
+        self._value    = default if default is not None else choices[0][1]
         self._btns     = {}
         inner = tk.Frame(self, bg=JW_PURPLE_LIGHT)
         inner.pack(fill="both", expand=True, padx=4, pady=4)
         for i, (label, val) in enumerate(choices):
             inner.columnconfigure(i, weight=1)
-            b = ctk.CTkButton(inner, text=label,
-                              height=34,
+            b = ctk.CTkButton(inner, text=label, height=44,
                               font=ctk.CTkFont("Segoe UI", 12, "bold"),
-                              corner_radius=6,
-                              border_width=0,
+                              corner_radius=6, border_width=0,
                               command=lambda v=val: self._select(v))
             b.grid(row=0, column=i, padx=3, pady=0, sticky="ew")
             self._btns[val] = b
@@ -226,11 +303,9 @@ class Selector(ctk.CTkFrame):
         self._value = val
         for v, b in self._btns.items():
             if v == val:
-                b.configure(fg_color=JW_PURPLE, hover_color=JW_PURPLE_DARK,
-                            text_color="#ffffff")
+                b.configure(fg_color=JW_PURPLE, hover_color=JW_PURPLE_DARK, text_color="#ffffff")
             else:
-                b.configure(fg_color=JW_PURPLE_LIGHT, hover_color="#ddd4f0",
-                            text_color=JW_PURPLE)
+                b.configure(fg_color=JW_PURPLE_LIGHT, hover_color="#ddd4f0", text_color=JW_PURPLE)
         if notify and self._callback:
             self._callback(val)
 
@@ -243,20 +318,33 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("JWMediaGet")
-        self.geometry("520x640")
-        self.minsize(420, 540)
+        self.geometry("680x680")
+        self.minsize(420, 560)
         self.resizable(True, True)
         self.configure(fg_color=JW_BG)
+
+        icon_img = tk.PhotoImage(width=32, height=32)
+        icon_img.put(JW_PURPLE, to=(0, 0, 32, 32))
+        self.iconphoto(True, icon_img)
+        self._icon_img = icon_img
 
         self._real_path = None
         self._stop_flag = False
         self._running   = False
         self.output_path = tk.StringVar(value=str(Path.home() / "Videos" / "JWLibrary"))
-
+        self._set_icon()
         self._build()
 
+    def _set_icon(self):
+        try:
+            img = tk.PhotoImage(width=32, height=32)
+            img.put(JW_PURPLE, to=(0, 0, 32, 32))
+            self.iconphoto(True, img)
+            self._icon_img = img  # keep reference
+        except Exception:
+            pass
+
     def _build(self):
-        # Шапка
         header = ctk.CTkFrame(self, fg_color=JW_PURPLE, corner_radius=0, height=56)
         header.pack(fill="x")
         header.pack_propagate(False)
@@ -269,7 +357,6 @@ class App(ctk.CTk):
 
         ctk.CTkFrame(self, fg_color=JW_BORDER, height=1, corner_radius=0).pack(fill="x")
 
-        # Тело
         body = ctk.CTkScrollableFrame(self, fg_color=JW_BG,
                                        scrollbar_button_color=JW_BORDER,
                                        scrollbar_button_hover_color="#ccbbee")
@@ -290,8 +377,7 @@ class App(ctk.CTk):
         ctk.CTkButton(fr, text="Выбрать", width=100, height=32,
                       font=ctk.CTkFont("Segoe UI", 11, "bold"),
                       fg_color=JW_PURPLE, hover_color=JW_PURPLE_DARK,
-                      corner_radius=6,
-                      command=self._pick_file).grid(row=0, column=1, padx=(10,0))
+                      corner_radius=6, command=self._pick_file).grid(row=0, column=1, padx=(10,0))
 
         # Папка
         self._sec(p, "Папка сохранения")
@@ -305,61 +391,47 @@ class App(ctk.CTk):
         ctk.CTkButton(fr2, text="Изменить", width=100, height=32,
                       font=ctk.CTkFont("Segoe UI", 11, "bold"),
                       fg_color=JW_PURPLE, hover_color=JW_PURPLE_DARK,
-                      corner_radius=6,
-                      command=self._pick_output).grid(row=0, column=1, padx=(10,0))
+                      corner_radius=6, command=self._pick_output).grid(row=0, column=1, padx=(10,0))
 
         # Качество
         self._sec(p, "Качество видео")
         qc = self._card(p)
         self._quality = Selector(qc,
-            [("240p","240"),("360p","360"),("480p","480"),("720p","720")])
+            [("240p","240"),("360p","360"),("480p","480"),("720p","720")], default="480")
         self._quality.pack(fill="x", padx=10, pady=10)
 
         # Что скачивать
         self._sec(p, "Что скачивать")
         sc = self._card(p)
         self._src = Selector(sc,
-            [("Всё","all"),("Только уроки","lessons"),("Доп. материалы","refs")])
+            [("Всё","all"),("Видео публикации","lessons"),("Ссылки","refs"),("Библия","bible")])
         self._src.pack(fill="x", padx=10, pady=10)
 
         # Кнопка
-        self.start_btn = ctk.CTkButton(p, text="Начать загрузку",
-                                        height=46,
+        self.start_btn = ctk.CTkButton(p, text="Начать загрузку", height=46,
                                         font=ctk.CTkFont("Segoe UI", 14, "bold"),
-                                        fg_color=JW_PURPLE,
-                                        hover_color=JW_PURPLE_DARK,
-                                        corner_radius=8,
-                                        command=self._start)
+                                        fg_color=JW_PURPLE, hover_color=JW_PURPLE_DARK,
+                                        corner_radius=8, command=self._start)
         self.start_btn.pack(fill="x", pady=(16,6))
 
-        # Статус + прогресс
-        self.status_lbl = ctk.CTkLabel(p, text="",
-                                        text_color=JW_TEXT_MUTED,
-                                        font=ctk.CTkFont("Segoe UI", 11),
-                                        anchor="w")
+        self.status_lbl = ctk.CTkLabel(p, text="", text_color=JW_TEXT_MUTED,
+                                        font=ctk.CTkFont("Segoe UI", 11), anchor="w")
         self.status_lbl.pack(fill="x", pady=(2,4))
 
         self.bar = ctk.CTkProgressBar(p, height=4, corner_radius=2,
-                                       fg_color=JW_BORDER,
-                                       progress_color=JW_PURPLE)
+                                       fg_color=JW_BORDER, progress_color=JW_PURPLE)
         self.bar.pack(fill="x", pady=(0,14))
         self.bar.set(0)
 
-        # Лог
         self._sec(p, "Лог загрузки")
-        self.log = ctk.CTkTextbox(p, height=170,
-                                   font=ctk.CTkFont("Consolas", 10),
-                                   fg_color=JW_WHITE,
-                                   text_color="#666666",
-                                   border_color=JW_BORDER,
-                                   border_width=1,
-                                   corner_radius=6,
-                                   state="disabled")
+        self.log = ctk.CTkTextbox(p, height=170, font=ctk.CTkFont("Consolas", 10),
+                                   fg_color=JW_WHITE, text_color="#666666",
+                                   border_color=JW_BORDER, border_width=1,
+                                   corner_radius=6, state="disabled")
         self.log.pack(fill="both", expand=True)
 
     def _sec(self, parent, text):
-        ctk.CTkLabel(parent, text=text,
-                     font=ctk.CTkFont("Segoe UI", 12, "bold"),
+        ctk.CTkLabel(parent, text=text, font=ctk.CTkFont("Segoe UI", 12, "bold"),
                      text_color=JW_TEXT, anchor="w").pack(fill="x", pady=(12,4))
 
     def _card(self, parent):
@@ -392,9 +464,8 @@ class App(ctk.CTk):
         if self._running: return
         self._running = True
         self._stop_flag = False
-        self.start_btn.configure(text="Остановить",
-                                  fg_color=JW_RED, hover_color="#b71c1c",
-                                  command=self._stop)
+        self.start_btn.configure(text="Остановить", fg_color=JW_RED,
+                                  hover_color="#b71c1c", command=self._stop)
         self.bar.set(0)
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -414,24 +485,38 @@ class App(ctk.CTk):
         except: saved = {}
 
         self.after(0, lambda: self.status_lbl.configure(text="Читаю файл..."))
+        session = make_session()
         try:
             tmp = tempfile.mkdtemp()
             db  = extract_db(jwpub, tmp)
             vids = collect_videos(db)
+
+            # Библейские главы
+            lang_idx = vids[0]["lang_idx"] if vids else 474
+            bible_vids = collect_bible_chapters(db, lang_idx) if src in ("all", "bible") else []
+
+            if src == "all":
+                vids = vids + bible_vids
+            elif src == "lessons":
+                vids = [v for v in vids if v["source"] == "урок"]
+            elif src == "refs":
+                vids = [v for v in vids if v["source"] == "материал"]
+            elif src == "bible":
+                vids = bible_vids
+
         except Exception as e:
             self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
             self._finish(); return
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-        if src == "lessons": vids = [v for v in vids if v["source"] == "урок"]
-        elif src == "refs":  vids = [v for v in vids if v["source"] == "материал"]
-
         total = len(vids)
+        bible_count = sum(1 for v in vids if v["source"] == "библия")
         self._log(f"Найдено {total} видео · {quality}p")
+        if bible_count:
+            self._log(f"  из них Библейских глав: {bible_count}")
         self._log("─" * 36)
 
-        session = make_session()
         ok = skip = err = 0
 
         for i, v in enumerate(vids):
@@ -451,25 +536,22 @@ class App(ctk.CTk):
             if saved.get(key) == "ok":
                 skip += 1; continue
 
-            url, fname, api_pub, api_booknum = api_get_url(session, v["symbol"], v["track"], lw, quality, v["issue"], v["filepath"], v.get("docid"), v.get("booknum"))
+            url, fname, api_pub, api_booknum = api_get_url(
+                session, v["symbol"], v["track"], lw, quality,
+                v["issue"], v["filepath"], v.get("docid"), v.get("booknum"))
+
             if url is None:
                 err += 1
                 self._log(f"✗ {v['label'][:52]}")
                 saved[key] = "err"; time.sleep(0.3); continue
 
-            # Логика папки как в JW Library:
-            # Некоторые pub — глобальные медиа, они идут в корень
-            # Остальные — в папку pub_RSL/
-            ROOT_PUBS = {
-                'sjj', 'sjjm', 'pk', 'ndl', 'wpc', 'wcgv',
-                'jlp', 'jwbcov', 'jwbcov21', 'jwbcov22',
-                'jwbcov23', 'jwbcov24', 'jwbcov25',
-            }
-            sym = api_pub or v["symbol"] or ""
+            # Символ публикации
+            sym = resolve_pub_symbol(v, api_pub, fname)
+
+            # Папка по логике JW Library
             is_root = (not sym) or (sym.lower() in ROOT_PUBS) or sym.lower().startswith('jwbcov')
             if sym and not is_root:
-                lang_suffix = f"_{lw}" if lw != "E" else ""
-                pub_folder = os.path.join(outdir, f"{sym}{lang_suffix}")
+                pub_folder = os.path.join(outdir, pub_folder_name(sym, lw, v["issue"]))
             else:
                 pub_folder = outdir
             os.makedirs(pub_folder, exist_ok=True)
@@ -478,7 +560,7 @@ class App(ctk.CTk):
             if os.path.exists(dest):
                 skip += 1; saved[key] = "ok"; continue
 
-            self._log(f"↓ {v['symbol'] or '?'} / {fname}")
+            self._log(f"↓ {sym or '?'} / {fname}")
             try:
                 download_file(url, dest, session)
                 ok += 1; saved[key] = "ok"
@@ -487,7 +569,7 @@ class App(ctk.CTk):
                 self._log(f"  ✗ {e}")
 
             try:
-                with open(log_path,"w",encoding="utf-8") as f:
+                with open(log_path, "w", encoding="utf-8") as f:
                     json.dump(saved, f, ensure_ascii=False)
             except: pass
             time.sleep(0.2)
