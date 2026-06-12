@@ -70,6 +70,8 @@ def pub_from_filename(fname):
     if not fname: return None
     base = fname.split(".")[0]
     parts = base.split("_")
+    if len(parts) >= 3 and parts[2].isdigit():
+        return parts[0]
     return parts[2] if len(parts) >= 3 else None
 
 def collect_videos(db_path):
